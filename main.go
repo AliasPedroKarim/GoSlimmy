@@ -8,13 +8,16 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 var (
-	Token     = flag.String("token", "", "Provide Bot Token")
-	GuildID   = flag.String("guildtest", "", "Guild ID for test command slash.")
+	Token     = flag.String("t", os.Getenv("TOKEN"), "Provide Bot Token")
+	GuildID   = flag.String("g", os.Getenv("GUILD_ID_TEST"), "Guild ID for test command slash.")
 	RemoveCmd = flag.Bool("rmcmd", true, "Remove command during shutting down bot.")
 )
 
@@ -46,7 +49,7 @@ type TusmoPartyGame struct {
 var (
 	tusmoMinAmount = 0.0
 
-	tusmoGameInProgress map[string]TusmoPartyGame = make(map[string]TusmoPartyGame)
+	tusmoGameInProgress = make(map[string]*TusmoPartyGame)
 
 	commands = []*discordgo.ApplicationCommand{
 		{
@@ -104,8 +107,6 @@ var (
 				var number int64 = 0
 				var content string
 
-				log.Println(i.ApplicationCommandData().Options[0])
-
 				if len(i.ApplicationCommandData().Options[0].Options) > 0 && i.ApplicationCommandData().Options[0].Options[0].Name == "number" {
 					number = i.ApplicationCommandData().Options[0].Options[0].IntValue()
 				}
@@ -123,7 +124,7 @@ var (
 					},
 				})
 
-				var referenceWord = "Discord"
+				var referenceWord = strings.ToUpper("Discord")
 				var a = strings.Split(referenceWord, "")
 
 				var currentWord = []string{a[0]}
@@ -131,11 +132,11 @@ var (
 					currentWord = append(currentWord, "\\_")
 				}
 
-				tusmoGameInProgress[i.Member.User.ID] = TusmoPartyGame{referenceWord, currentWord, TUSMO_AMOUNT_TRY, int(number), 1}
+				tusmoGameInProgress[i.Member.User.ID] = &TusmoPartyGame{referenceWord, currentWord, TUSMO_AMOUNT_TRY, int(number), 1}
 
 				_, err := dgs.FollowupMessageCreate(dgs.State.User.ID, i.Interaction, true, &discordgo.WebhookParams{
 					Content: fmt.Sprintf(
-						"Round: %v --- Retry remaining: %v \n"+
+						"Round: **%v** | Retry remaining: **%v** \n"+
 							"You have to guess the word: %v",
 						tusmoGameInProgress[i.Member.User.ID].Round,
 						tusmoGameInProgress[i.Member.User.ID].retryRemaining,
@@ -159,10 +160,88 @@ var (
 	}
 )
 
-func messageCreate(s *discordgo.Session, i *discordgo.MessageCreate) {
+func isMn(r rune) bool {
+	return unicode.Is(unicode.Mn, r)
+}
+
+func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
+	// Forbid the management of messages not concerned
+	if m.Author.ID == s.State.User.ID || m.Author.Bot == true {
+		return
+	}
+
+	t := transform.Chain(norm.NFD, transform.RemoveFunc(isMn), norm.NFC)
+
+	authorID := m.Author.ID
+
 	// Check if player
-	if _, ok := tusmoGameInProgress[i.Member.User.ID]; ok {
-		// s.ChannelMessageSend(i.ChannelID, )
+	if tusmoParty, ok := tusmoGameInProgress[authorID]; ok {
+		var message = "A party of **Tusmo** is in progress for you."
+
+		args := strings.Split(m.Content, " ")
+		if len(args) > 0 {
+			// Normalize string
+			stringNorm, _, _ := transform.String(t, args[0])
+
+			term := strings.Split(strings.ToUpper(stringNorm), "")
+			referenceWord := tusmoParty.referenceWord
+			referenceWordArr := strings.Split(referenceWord, "")
+
+			if len(term) == len(referenceWordArr) {
+				currentWordBefore := strings.Split(strings.Join(tusmoParty.currentWord, "|"), "|")
+
+				word := []string{}
+				for k, v := range referenceWordArr {
+					if term[k] == v {
+						word = append(word, "("+term[k]+")")
+						tusmoParty.currentWord[k] = term[k]
+					} else if strings.Contains(referenceWord, term[k]) {
+						word = append(word, "<"+term[k]+">")
+					} else {
+						word = append(word, "~~"+term[k]+"~~")
+					}
+				}
+
+				// Don't missing, i use backslash because discord md format :3
+				if !contains(tusmoParty.currentWord, "\\_") {
+					message =
+						fmt.Sprintf(
+							"🎉 Congratulations! You have found the word you were looking for which was: **%v**",
+							tusmoParty.referenceWord,
+						)
+					delete(tusmoGameInProgress, authorID)
+				} else {
+					tusmoParty.retryRemaining = tusmoParty.retryRemaining - 1
+
+					// Parti perdu
+					if tusmoParty.retryRemaining <= 0 {
+						message = fmt.Sprintf(
+							"**Game Over** | Search word was: **%v**",
+							tusmoParty.referenceWord,
+						)
+						delete(tusmoGameInProgress, authorID)
+					} else {
+						message = fmt.Sprintf(
+							"Round: **%v** | Retry remaining: **%v** \n"+
+								"--- --- --- --- --- --- --- --- ---\n"+
+								"**Letter Legend:** \n- `(A)` Good position and present\n- `<B>` Bad position and present\n- ~~`C`~~ Bad position and not present\n"+
+								"--- --- --- --- --- --- --- --- ---\n"+
+								"**Letter found before:** %v\n"+
+								"**Letter status:** %v",
+							tusmoParty.Round,
+							tusmoParty.retryRemaining,
+							strings.Join(currentWordBefore, " **|** "),
+							strings.Join(word, " **|** "),
+						)
+					}
+				}
+			} else {
+				message = "The length of the first word you wrote does not match the length of the word you are looking for."
+			}
+
+		}
+
+		s.ChannelMessageSend(m.ChannelID, message)
 	}
 }
 
@@ -172,6 +251,8 @@ func init() {
 			h(s, i)
 		}
 	})
+
+	dgs.AddHandler(messageCreate)
 }
 
 func main() {
