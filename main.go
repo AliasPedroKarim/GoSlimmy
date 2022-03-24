@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
@@ -8,17 +9,18 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"unicode"
 
 	"github.com/bwmarrin/discordgo"
-	"golang.org/x/text/transform"
-	"golang.org/x/text/unicode/norm"
 )
 
 var (
 	Token     = flag.String("t", os.Getenv("TOKEN"), "Provide Bot Token")
 	GuildID   = flag.String("g", os.Getenv("GUILD_ID_TEST"), "Guild ID for test command slash.")
 	RemoveCmd = flag.Bool("rmcmd", true, "Remove command during shutting down bot.")
+
+	Test                 = flag.Bool("test", envToBool(os.Getenv("TEST")), "Allows to launch the robot in test.")
+	UsersAllowInTestGrap = flag.String("userstest", os.Getenv("USERS_TEST"), "List of users allow use bot in test mode.")
+	UsersAllowInTest     = envToArrString(*UsersAllowInTestGrap)
 )
 
 var dgs *discordgo.Session
@@ -44,12 +46,23 @@ type TusmoPartyGame struct {
 	retryRemaining int
 	maxRound       int
 	Round          int
+	partyWin       int
+}
+
+type TusmoLaunchGameParams struct {
+	userID    string
+	channelID string
+	number    int64
 }
 
 var (
-	tusmoMinAmount = 0.0
-
+	tusmoMinAmount      = 0.0
 	tusmoGameInProgress = make(map[string]*TusmoPartyGame)
+
+	wordAlreadySeen = []string{}
+
+	messageTipCancel = "**Tips:** _If you don't want to continue playing **Tusmo Game** just write `cancel`._\n"
+	messageBotTest   = "This bot is currently under test, you are not an authorized user to use the commands of this bot in the tests."
 
 	commands = []*discordgo.ApplicationCommand{
 		{
@@ -124,32 +137,7 @@ var (
 					},
 				})
 
-				var referenceWord = strings.ToUpper("Discord")
-				var a = strings.Split(referenceWord, "")
-
-				var currentWord = []string{a[0]}
-				for i := 1; i < len(a); i++ {
-					currentWord = append(currentWord, "\\_")
-				}
-
-				tusmoGameInProgress[i.Member.User.ID] = &TusmoPartyGame{referenceWord, currentWord, TUSMO_AMOUNT_TRY, int(number), 1}
-
-				_, err := dgs.FollowupMessageCreate(dgs.State.User.ID, i.Interaction, true, &discordgo.WebhookParams{
-					Content: fmt.Sprintf(
-						"Round: **%v** | Retry remaining: **%v** \n"+
-							"You have to guess the word: %v",
-						tusmoGameInProgress[i.Member.User.ID].Round,
-						tusmoGameInProgress[i.Member.User.ID].retryRemaining,
-						strings.Join(tusmoGameInProgress[i.Member.User.ID].currentWord, " | "),
-					),
-				})
-
-				if err != nil {
-					dgs.FollowupMessageCreate(dgs.State.User.ID, i.Interaction, true, &discordgo.WebhookParams{
-						Content: "Something went wrong",
-					})
-					return
-				}
+				tusmoLaunchGame(TusmoLaunchGameParams{userID: i.Member.User.ID, channelID: i.Interaction.ChannelID, number: number})
 
 				break
 			default:
@@ -160,8 +148,99 @@ var (
 	}
 )
 
-func isMn(r rune) bool {
-	return unicode.Is(unicode.Mn, r)
+var (
+	dictionnary = []string{}
+)
+
+func init() {
+	file, err := os.Open("dictionary.csv")
+	if err != nil {
+		log.Printf("An error is occured durring loading dico file: %v", err)
+		return
+	}
+	log.Printf("Dictionary file loaded successfully.")
+	defer file.Close()
+
+	csvReader := csv.NewReader(file)
+	// Allows not to send an error if the rule of the number of column of a CSV is not respected
+	csvReader.FieldsPerRecord = -1
+	fileLines, err := csvReader.ReadAll()
+	if err != nil {
+		log.Printf("An error is occured durring read dico file csv: %v", err)
+		return
+	}
+
+	replacer := strings.NewReplacer(".", "", "_", "", "-", "", "'", "")
+
+	for _, line := range fileLines {
+		if len(line) >= 2 {
+			// Do not load words with spaces!
+			if !strings.Contains(line[1], " ") {
+				dictionnary = append(dictionnary, replacer.Replace(normalizeString(line[1])))
+			}
+		}
+	}
+}
+
+func getNewWordFromDico() string {
+	newWord := false
+	for !newWord {
+		word, err := getRandomStringFromArray(dictionnary)
+
+		if err != nil {
+			break
+		}
+
+		if !contains(wordAlreadySeen, word) {
+			return word
+		}
+	}
+	return ""
+}
+
+func tusmoLaunchGame(params TusmoLaunchGameParams) {
+	var referenceWord = strings.ToUpper(getNewWordFromDico())
+	var a = strings.Split(referenceWord, "")
+
+	var currentWord = []string{a[0]}
+	for i := 1; i < len(a); i++ {
+		currentWord = append(currentWord, "\\_")
+	}
+
+	okReStart := true
+
+	if _, ok := tusmoGameInProgress[params.userID]; !ok {
+		tusmoGameInProgress[params.userID] = &TusmoPartyGame{referenceWord, currentWord, TUSMO_AMOUNT_TRY, int(params.number), 1, 0}
+		okReStart = false
+	}
+	var tusmoParty = tusmoGameInProgress[params.userID]
+
+	if okReStart {
+		tusmoParty.currentWord = currentWord
+		tusmoParty.referenceWord = referenceWord
+		tusmoParty.retryRemaining = TUSMO_AMOUNT_TRY
+	}
+
+	log.Printf("[DEBUG] User ID: %v | Word wanted: %v", params.userID, tusmoParty.referenceWord)
+
+	dgs.ChannelMessageSend(
+		params.channelID,
+		fmt.Sprintf(
+			messageTipCancel+
+				"Round: **%v**/**%v** | Retry remaining: **%v** | Lenght current word : **%v** \n"+
+				"--- --- --- --- --- --- --- --- ---\n"+
+				"You have to guess the word: %v",
+			tusmoParty.Round,
+			tusmoParty.maxRound,
+			tusmoParty.retryRemaining,
+			len(tusmoParty.currentWord),
+			strings.Join(tusmoParty.currentWord, " **|** "),
+		),
+	)
+}
+
+func tusmoFinishGame(userID string) {
+	delete(tusmoGameInProgress, userID)
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -170,8 +249,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	t := transform.Chain(norm.NFD, transform.RemoveFunc(isMn), norm.NFC)
-
 	authorID := m.Author.ID
 
 	// Check if player
@@ -179,11 +256,19 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		var message = "A party of **Tusmo** is in progress for you."
 
 		args := strings.Split(m.Content, " ")
-		if len(args) > 0 {
-			// Normalize string
-			stringNorm, _, _ := transform.String(t, args[0])
 
-			term := strings.Split(strings.ToUpper(stringNorm), "")
+		if len(args) == 1 {
+			// Command tusmo party game
+			term := strings.Split(strings.ToUpper(normalizeString(args[0])), "")
+
+			switch strings.ToLower(args[0]) {
+			case "cancel":
+				tusmoFinishGame(authorID)
+				s.ChannelMessageSend(m.ChannelID, "You just canceled the game.")
+				return
+			}
+
+			// Normalize string
 			referenceWord := tusmoParty.referenceWord
 			referenceWordArr := strings.Split(referenceWord, "")
 
@@ -204,14 +289,28 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 				// Don't missing, i use backslash because discord md format :3
 				if !contains(tusmoParty.currentWord, "\\_") {
-					message =
-						fmt.Sprintf(
-							"🎉 Congratulations! You have found the word you were looking for which was: **%v**",
-							tusmoParty.referenceWord,
+					tusmoParty.Round++
+
+					message = fmt.Sprintf(
+						"👏 You have found the word you were looking for which was: **%v**",
+						tusmoParty.referenceWord,
+					)
+					s.ChannelMessageSend(m.ChannelID, message)
+
+					if tusmoParty.maxRound != 0 && (tusmoParty.maxRound+1) == tusmoParty.Round {
+						message = fmt.Sprintf(
+							"🎉 Congratulations %v! You succeeded in finding all the words.",
+							m.Author,
 						)
-					delete(tusmoGameInProgress, authorID)
+
+						tusmoFinishGame(authorID)
+					} else {
+						tusmoLaunchGame(TusmoLaunchGameParams{userID: authorID, channelID: m.ChannelID})
+						return
+					}
+
 				} else {
-					tusmoParty.retryRemaining = tusmoParty.retryRemaining - 1
+					tusmoParty.retryRemaining--
 
 					// Parti perdu
 					if tusmoParty.retryRemaining <= 0 {
@@ -219,18 +318,23 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 							"**Game Over** | Search word was: **%v**",
 							tusmoParty.referenceWord,
 						)
-						delete(tusmoGameInProgress, authorID)
+						tusmoFinishGame(authorID)
 					} else {
 						message = fmt.Sprintf(
-							"Round: **%v** | Retry remaining: **%v** \n"+
+							messageTipCancel+
+								"Round: **%v**/**%v** | Retry remaining: **%v** | Lenght current word : **%v** \n"+
 								"--- --- --- --- --- --- --- --- ---\n"+
 								"**Letter Legend:** \n- `(A)` Good position and present\n- `<B>` Bad position and present\n- ~~`C`~~ Bad position and not present\n"+
 								"--- --- --- --- --- --- --- --- ---\n"+
 								"**Letter found before:** %v\n"+
+								"**Letter found after:** %v | (**tips copy :** %s)\n"+
 								"**Letter status:** %v",
 							tusmoParty.Round,
+							tusmoParty.maxRound,
 							tusmoParty.retryRemaining,
+							len(tusmoParty.currentWord),
 							strings.Join(currentWordBefore, " **|** "),
+							strings.Join(tusmoParty.currentWord, " **|** "), strings.Join(tusmoParty.currentWord, ""),
 							strings.Join(word, " **|** "),
 						)
 					}
@@ -248,6 +352,19 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 func init() {
 	dgs.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if h, ok := commandsHandler[i.ApplicationCommandData().Name]; ok {
+
+			if *Test && !contains(UsersAllowInTest, i.Member.User.ID) {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Flags:   1 << 6,
+						Content: messageBotTest,
+					},
+				})
+
+				return
+			}
+
 			h(s, i)
 		}
 	})
@@ -282,6 +399,9 @@ func main() {
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
+	if *Test {
+		log.Println("This Application is running in test mode.")
+	}
 	log.Println("Press Ctrl + C to exit.")
 	<-sc
 
