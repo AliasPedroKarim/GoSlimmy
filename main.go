@@ -61,8 +61,8 @@ var (
 
 	wordAlreadySeen = []string{}
 
-	messageTipCancel = "**Tips:** _If you don't want to continue playing **Tusmo Game** just write `cancel`._\n"
-	messageBotTest   = "This bot is currently under test, you are not an authorized user to use the commands of this bot in the tests."
+	messageTipQuite = "**Tips:** _If you don't want to continue playing **Tusmo Game** just write `>quit`._\n"
+	messageBotTest  = "This bot is currently under test, you are not an authorized user to use the commands of this bot in the tests."
 
 	commands = []*discordgo.ApplicationCommand{
 		{
@@ -140,8 +140,6 @@ var (
 				tusmoLaunchGame(TusmoLaunchGameParams{userID: i.Member.User.ID, channelID: i.Interaction.ChannelID, number: number})
 
 				break
-			default:
-				log.Println("[Tusmo] >> BAH rien !!")
 			}
 
 		},
@@ -215,6 +213,11 @@ func tusmoLaunchGame(params TusmoLaunchGameParams) {
 	}
 	var tusmoParty = tusmoGameInProgress[params.userID]
 
+	numberString := fmt.Sprintf("%v", tusmoParty.maxRound)
+	if tusmoParty.maxRound == 0 {
+		numberString = "infinite"
+	}
+
 	if okReStart {
 		tusmoParty.currentWord = currentWord
 		tusmoParty.referenceWord = referenceWord
@@ -226,12 +229,12 @@ func tusmoLaunchGame(params TusmoLaunchGameParams) {
 	dgs.ChannelMessageSend(
 		params.channelID,
 		fmt.Sprintf(
-			messageTipCancel+
+			messageTipQuite+
 				"Round: **%v**/**%v** | Retry remaining: **%v** | Lenght current word : **%v** \n"+
 				"--- --- --- --- --- --- --- --- ---\n"+
 				"You have to guess the word: %v",
 			tusmoParty.Round,
-			tusmoParty.maxRound,
+			numberString,
 			tusmoParty.retryRemaining,
 			len(tusmoParty.currentWord),
 			strings.Join(tusmoParty.currentWord, " **|** "),
@@ -257,16 +260,36 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		args := strings.Split(m.Content, " ")
 
+		max := fmt.Sprintf("%v", tusmoParty.maxRound)
+		if tusmoParty.maxRound == 0 {
+			max = "infinite"
+		}
+
 		if len(args) == 1 {
 			// Command tusmo party game
 			term := strings.Split(strings.ToUpper(normalizeString(args[0])), "")
 
 			switch strings.ToLower(args[0]) {
-			case "cancel":
+			case ">quit":
+				s.ChannelMessageSend(
+					m.ChannelID,
+					fmt.Sprintf(
+						"🚪 You have just left the game and your score is **%v**/**%v** games won.",
+						tusmoParty.Round-1,
+						max,
+					),
+				)
 				tusmoFinishGame(authorID)
-				s.ChannelMessageSend(m.ChannelID, "You just canceled the game.")
+				return
+			case ">relaunch":
+				numberRound := tusmoParty.maxRound
+
+				tusmoFinishGame(authorID)
+				s.ChannelMessageSend(m.ChannelID, "🔄 You have just restarted the whole game with the same parameters.")
+				tusmoLaunchGame(TusmoLaunchGameParams{userID: authorID, channelID: m.ChannelID, number: int64(numberRound)})
 				return
 			}
+			// End command tusmo party game
 
 			// Normalize string
 			referenceWord := tusmoParty.referenceWord
@@ -299,7 +322,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 					if tusmoParty.maxRound != 0 && (tusmoParty.maxRound+1) == tusmoParty.Round {
 						message = fmt.Sprintf(
-							"🎉 Congratulations %v! You succeeded in finding all the words.",
+							"🎉 Congratulations %v! You succeeded in finding all the words.\n",
 							m.Author,
 						)
 
@@ -315,13 +338,16 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 					// Parti perdu
 					if tusmoParty.retryRemaining <= 0 {
 						message = fmt.Sprintf(
-							"**Game Over** | Search word was: **%v**",
+							"**Game Over** | Search word was: **%v**\n"+
+								"Your score is **%v**/**%v** games won.",
 							tusmoParty.referenceWord,
+							tusmoParty.Round-1,
+							max,
 						)
 						tusmoFinishGame(authorID)
 					} else {
 						message = fmt.Sprintf(
-							messageTipCancel+
+							messageTipQuite+
 								"Round: **%v**/**%v** | Retry remaining: **%v** | Lenght current word : **%v** \n"+
 								"--- --- --- --- --- --- --- --- ---\n"+
 								"**Letter Legend:** \n- `(A)` Good position and present\n- `<B>` Bad position and present\n- ~~`C`~~ Bad position and not present\n"+
@@ -330,7 +356,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 								"**Letter found after:** %v | (**tips copy :** %s)\n"+
 								"**Letter status:** %v",
 							tusmoParty.Round,
-							tusmoParty.maxRound,
+							max,
 							tusmoParty.retryRemaining,
 							len(tusmoParty.currentWord),
 							strings.Join(currentWordBefore, " **|** "),
