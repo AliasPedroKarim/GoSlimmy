@@ -15,3 +15,6 @@
 # vendor/
 
 .env
+
+# files test generated
+prod.png

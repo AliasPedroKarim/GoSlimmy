@@ -31,7 +31,7 @@ func init() {
 	var err error
 	dgs, err = discordgo.New("Bot " + *Token)
 	if err != nil {
-		log.Println("Error durring creating Discord Client Session: ", err)
+		log.Println("Error during creating Discord Client Session: ", err)
 		return
 	}
 
@@ -40,19 +40,25 @@ func init() {
 
 const TUSMO_AMOUNT_TRY int = 6
 
-type TusmoPartyGame struct {
-	referenceWord  string
-	currentWord    []string
-	retryRemaining int
-	maxRound       int
-	Round          int
-	partyWin       int
+type TusmoPartyGamePlayer struct {
+	ID, Username, Discriminator string
 }
 
-type TusmoLaunchGameParams struct {
-	userID    string
-	channelID string
-	number    int64
+func (player *TusmoPartyGamePlayer) Tag() string {
+	return fmt.Sprintf("%v#%v", player.Username, player.Discriminator)
+}
+
+type TusmoPartyGame struct {
+	RetryRemaining, RaxRound, Round, RoundWin int
+	ReferenceWord                             string
+	CurrentWord                               []string
+	Player                                    *TusmoPartyGamePlayer
+}
+
+type TusmoPartyGameLaunchParams struct {
+	ChannelID string
+	Number    int64
+	Player    *TusmoPartyGamePlayer
 }
 
 var (
@@ -137,7 +143,11 @@ var (
 					},
 				})
 
-				tusmoLaunchGame(TusmoLaunchGameParams{userID: i.Member.User.ID, channelID: i.Interaction.ChannelID, number: number})
+				TusmoPartyGameLaunch(TusmoPartyGameLaunchParams{Player: &TusmoPartyGamePlayer{
+					ID:            i.Member.User.ID,
+					Username:      i.Member.User.Username,
+					Discriminator: i.Member.User.Discriminator,
+				}, ChannelID: i.Interaction.ChannelID, Number: number})
 
 				break
 			}
@@ -153,7 +163,7 @@ var (
 func init() {
 	file, err := os.Open("dictionary.csv")
 	if err != nil {
-		log.Printf("An error is occured durring loading dico file: %v", err)
+		log.Printf("An error is occured during loading dico file: %v", err)
 		return
 	}
 	log.Printf("Dictionary file loaded successfully.")
@@ -164,7 +174,7 @@ func init() {
 	csvReader.FieldsPerRecord = -1
 	fileLines, err := csvReader.ReadAll()
 	if err != nil {
-		log.Printf("An error is occured durring read dico file csv: %v", err)
+		log.Printf("An error is occured during read dico file csv: %v", err)
 		return
 	}
 
@@ -196,7 +206,7 @@ func getNewWordFromDico() string {
 	return ""
 }
 
-func tusmoLaunchGame(params TusmoLaunchGameParams) {
+func TusmoPartyGameLaunch(params TusmoPartyGameLaunchParams) *TusmoPartyGame {
 	var referenceWord = strings.ToUpper(getNewWordFromDico())
 	var a = strings.Split(referenceWord, "")
 
@@ -207,27 +217,35 @@ func tusmoLaunchGame(params TusmoLaunchGameParams) {
 
 	okReStart := true
 
-	if _, ok := tusmoGameInProgress[params.userID]; !ok {
-		tusmoGameInProgress[params.userID] = &TusmoPartyGame{referenceWord, currentWord, TUSMO_AMOUNT_TRY, int(params.number), 1, 0}
+	if _, ok := tusmoGameInProgress[params.Player.ID]; !ok {
+		tusmoGameInProgress[params.Player.ID] = &TusmoPartyGame{
+			ReferenceWord:  referenceWord,
+			CurrentWord:    currentWord,
+			RetryRemaining: TUSMO_AMOUNT_TRY,
+			RaxRound:       int(params.Number),
+			Round:          1,
+			RoundWin:       0,
+			Player:         params.Player,
+		}
 		okReStart = false
 	}
-	var tusmoParty = tusmoGameInProgress[params.userID]
+	var tusmoParty = tusmoGameInProgress[params.Player.ID]
 
-	numberString := fmt.Sprintf("%v", tusmoParty.maxRound)
-	if tusmoParty.maxRound == 0 {
+	numberString := fmt.Sprintf("%v", tusmoParty.RaxRound)
+	if tusmoParty.RaxRound == 0 {
 		numberString = "infinite"
 	}
 
 	if okReStart {
-		tusmoParty.currentWord = currentWord
-		tusmoParty.referenceWord = referenceWord
-		tusmoParty.retryRemaining = TUSMO_AMOUNT_TRY
+		tusmoParty.CurrentWord = currentWord
+		tusmoParty.ReferenceWord = referenceWord
+		tusmoParty.RetryRemaining = TUSMO_AMOUNT_TRY
 	}
 
-	log.Printf("[DEBUG] User ID: %v | Word wanted: %v", params.userID, tusmoParty.referenceWord)
+	log.Printf("[DEBUG] User: %v | Word wanted: %v", params.Player.Tag(), tusmoParty.ReferenceWord)
 
 	dgs.ChannelMessageSend(
-		params.channelID,
+		params.ChannelID,
 		fmt.Sprintf(
 			messageTipQuite+
 				"Round: **%v**/**%v** | Retry remaining: **%v** | Lenght current word : **%v** \n"+
@@ -235,15 +253,32 @@ func tusmoLaunchGame(params TusmoLaunchGameParams) {
 				"You have to guess the word: %v",
 			tusmoParty.Round,
 			numberString,
-			tusmoParty.retryRemaining,
-			len(tusmoParty.currentWord),
-			strings.Join(tusmoParty.currentWord, " **|** "),
+			tusmoParty.RetryRemaining,
+			len(tusmoParty.CurrentWord),
+			strings.Join(tusmoParty.CurrentWord, " **|** "),
 		),
 	)
+
+	TusmoPartyGameSendImage(*tusmoParty, params.ChannelID)
+
+	return tusmoParty
 }
 
-func tusmoFinishGame(userID string) {
+func TusmoPartyGameFinish(userID string) {
 	delete(tusmoGameInProgress, userID)
+}
+
+func TusmoPartyGameSendImage(tusmoParty TusmoPartyGame, ChannelID string) {
+	reader := generateTusmoImage(TusmoPartyGameImageParams{
+		WaterMark: TusmoPartyGameImageWaterMark{
+			Name: fmt.Sprintf(".%v", dgs.State.User.Username),
+			URL:  dgs.State.User.AvatarURL("512"),
+		},
+		Username: tusmoParty.Player.Tag(),
+		Word:     strings.ReplaceAll(strings.Join(tusmoParty.CurrentWord, " "), "\\", ""),
+	})
+
+	dgs.ChannelFileSend(ChannelID, fmt.Sprintf("tusmo_game_%v.png", tusmoParty.Player.ID), reader)
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -260,8 +295,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		args := strings.Split(m.Content, " ")
 
-		max := fmt.Sprintf("%v", tusmoParty.maxRound)
-		if tusmoParty.maxRound == 0 {
+		max := fmt.Sprintf("%v", tusmoParty.RaxRound)
+		if tusmoParty.RaxRound == 0 {
 			max = "infinite"
 		}
 
@@ -279,30 +314,30 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 						max,
 					),
 				)
-				tusmoFinishGame(authorID)
+				TusmoPartyGameFinish(authorID)
 				return
 			case ">relaunch":
-				numberRound := tusmoParty.maxRound
+				numberRound := tusmoParty.RaxRound
 
-				tusmoFinishGame(authorID)
+				TusmoPartyGameFinish(authorID)
 				s.ChannelMessageSend(m.ChannelID, "🔄 You have just restarted the whole game with the same parameters.")
-				tusmoLaunchGame(TusmoLaunchGameParams{userID: authorID, channelID: m.ChannelID, number: int64(numberRound)})
+				TusmoPartyGameLaunch(TusmoPartyGameLaunchParams{ChannelID: m.ChannelID, Number: int64(numberRound), Player: tusmoParty.Player})
 				return
 			}
 			// End command tusmo party game
 
 			// Normalize string
-			referenceWord := tusmoParty.referenceWord
+			referenceWord := tusmoParty.ReferenceWord
 			referenceWordArr := strings.Split(referenceWord, "")
 
 			if len(term) == len(referenceWordArr) {
-				currentWordBefore := strings.Split(strings.Join(tusmoParty.currentWord, "|"), "|")
+				currentWordBefore := strings.Split(strings.Join(tusmoParty.CurrentWord, "|"), "|")
 
 				word := []string{}
 				for k, v := range referenceWordArr {
 					if term[k] == v {
 						word = append(word, "("+term[k]+")")
-						tusmoParty.currentWord[k] = term[k]
+						tusmoParty.CurrentWord[k] = term[k]
 					} else if strings.Contains(referenceWord, term[k]) {
 						word = append(word, "<"+term[k]+">")
 					} else {
@@ -311,40 +346,40 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				}
 
 				// Don't missing, i use backslash because discord md format :3
-				if !contains(tusmoParty.currentWord, "\\_") {
+				if !contains(tusmoParty.CurrentWord, "\\_") {
 					tusmoParty.Round++
 
 					message = fmt.Sprintf(
 						"👏 You have found the word you were looking for which was: **%v**",
-						tusmoParty.referenceWord,
+						tusmoParty.ReferenceWord,
 					)
 					s.ChannelMessageSend(m.ChannelID, message)
 
-					if tusmoParty.maxRound != 0 && (tusmoParty.maxRound+1) == tusmoParty.Round {
+					if tusmoParty.RaxRound != 0 && (tusmoParty.RaxRound+1) == tusmoParty.Round {
 						message = fmt.Sprintf(
 							"🎉 Congratulations %v! You succeeded in finding all the words.\n",
 							m.Author,
 						)
 
-						tusmoFinishGame(authorID)
+						TusmoPartyGameFinish(authorID)
 					} else {
-						tusmoLaunchGame(TusmoLaunchGameParams{userID: authorID, channelID: m.ChannelID})
+						TusmoPartyGameLaunch(TusmoPartyGameLaunchParams{ChannelID: m.ChannelID})
 						return
 					}
 
 				} else {
-					tusmoParty.retryRemaining--
+					tusmoParty.RetryRemaining--
 
 					// Parti perdu
-					if tusmoParty.retryRemaining <= 0 {
+					if tusmoParty.RetryRemaining <= 0 {
 						message = fmt.Sprintf(
 							"**Game Over** | Search word was: **%v**\n"+
 								"Your score is **%v**/**%v** games won.",
-							tusmoParty.referenceWord,
+							tusmoParty.ReferenceWord,
 							tusmoParty.Round-1,
 							max,
 						)
-						tusmoFinishGame(authorID)
+						TusmoPartyGameFinish(authorID)
 					} else {
 						message = fmt.Sprintf(
 							messageTipQuite+
@@ -353,25 +388,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 								"**Letter Legend:** \n- `(A)` Good position and present\n- `<B>` Bad position and present\n- ~~`C`~~ Bad position and not present\n"+
 								"--- --- --- --- --- --- --- --- ---\n"+
 								"**Letter found before:** %v\n"+
-								"**Letter found after:** %v | (**tips copy :** %s)\n"+
+								"**Tips copy:** %v\n"+
 								"**Letter status:** %v",
 							tusmoParty.Round,
 							max,
-							tusmoParty.retryRemaining,
-							len(tusmoParty.currentWord),
+							tusmoParty.RetryRemaining,
+							len(tusmoParty.CurrentWord),
 							strings.Join(currentWordBefore, " **|** "),
-							strings.Join(tusmoParty.currentWord, " **|** "), strings.Join(tusmoParty.currentWord, ""),
+							strings.Join(tusmoParty.CurrentWord, ""),
 							strings.Join(word, " **|** "),
 						)
+						s.ChannelMessageSend(m.ChannelID, message)
+
+						if strings.Join(currentWordBefore, "") != strings.Join(tusmoParty.CurrentWord, "") {
+							TusmoPartyGameSendImage(*tusmoParty, m.ChannelID)
+						}
+
+						return
 					}
 				}
 			} else {
 				message = "The length of the first word you wrote does not match the length of the word you are looking for."
 			}
 
+			s.ChannelMessageSend(m.ChannelID, message)
 		}
-
-		s.ChannelMessageSend(m.ChannelID, message)
 	}
 }
 
